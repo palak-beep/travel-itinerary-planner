@@ -248,6 +248,7 @@ def tab_itinerary(cfg, prefs, mode) -> None:
                 try:
                     it = build_itinerary(cfg, prefs)
                     ss.itinerary, ss.trip_prefs, ss.undo = it, copy.deepcopy(prefs), []
+                    ss.itinerary_source = "Demo sample" if cfg.is_demo else f"{cfg.provider} ({cfg.model or llm.DEFAULT_MODELS[cfg.provider]})"
                     if cfg.is_demo and prefs.days > len(it.days):
                         st.info(f"Demo mode has {len(it.days)} sample days. Add an API key for longer trips.")
                     elif len(it.days) < prefs.days:
@@ -261,6 +262,11 @@ def tab_itinerary(cfg, prefs, mode) -> None:
         return
     tp: Preferences = ss.trip_prefs or prefs
     money = Money(it, mode, prefs.inr_per_usd)
+    if it.is_demo:
+        label = "Source: demo sample plan, not written by an AI model"
+    else:
+        label = "Source: " + (ss.get("itinerary_source") or "saved trip")
+    st.markdown(compact(f'<span class="pill">{h(label)}</span>'), unsafe_allow_html=True)
     render_summary(it, tp, money)
     running = 0.0
     for day in it.days:
