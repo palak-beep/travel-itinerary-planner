@@ -17,7 +17,7 @@ from models import ModelError
 T = TypeVar("T")
 
 DEMO = "Demo (no key needed)"
-DEFAULT_MODELS = {"Gemini": "gemini-2.5-flash", "Groq": "llama-3.3-70b-versatile"}
+DEFAULT_MODELS = {"Gemini": "gemini-3.6-flash", "Groq": "openai/gpt-oss-120b"}
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 TIMEOUT = 90
@@ -25,6 +25,10 @@ TIMEOUT = 90
 
 class LLMError(Exception):
     """A readable error for the UI (bad key, quota, network, unusable reply)."""
+
+
+class ModelNotFound(LLMError):
+    """The model name does not exist (often because the provider retired it)."""
 
 
 @dataclass
@@ -49,7 +53,7 @@ def _http_error(provider: str, resp: requests.Response) -> LLMError:
     if code in (400, 401, 403):
         return LLMError(f"{provider} rejected the request ({code}). Check your API key and model name. {detail[:160]}")
     if code == 404:
-        return LLMError(f"{provider} could not find that model. Check the model name in the sidebar.")
+        return ModelNotFound(f"{provider} could not find the model name in the sidebar. Providers retire models often.")
     if code == 429:
         return LLMError(f"{provider} rate limit or free quota reached. Wait a minute and try again.")
     return LLMError(f"{provider} returned an error ({code}). {detail[:160]}")
@@ -70,7 +74,44 @@ def _post(provider: str, url: str, **kwargs) -> dict:
         raise LLMError(f"{provider} sent a reply that was not JSON.")
 
 
+def _gemini_config(model: str, temperature: float) -> dict:
+    cfg = {"responseMimeType": "application/json", "maxOutputTokens": 8192}
+    # Gemini 3 and later reject/ignore sampling parameters such as temperature.
+    if not model.startswith("gemini-3"):
+        cfg["temperature"] = temperature
+    return cfg
+
+
+def available_models(cfg: LLMConfig) -> list:
+    """Ask the provider which models this key can use (best effort, never raises)."""
+    try:
+        if cfg.provider == "Gemini":
+            r = requests.get("https://generativelanguage.googleapis.com/v1beta/models?pageSize=100",
+                             headers={"x-goog-api-key": cfg.api_key}, timeout=15)
+            names = [m["name"].replace("models/", "") for m in r.json().get("models", [])
+                     if "generateContent" in m.get("supportedGenerationMethods", [])]
+            skip = ("image", "tts", "embed", "live", "robotics", "computer", "audio", "veo", "imagen")
+            names = [n for n in names if n.startswith("gemini") and not any(k in n for k in skip)]
+            return sorted(names, key=lambda n: ("flash" not in n, n))
+        r = requests.get("https://api.groq.com/openai/v1/models",
+                         headers={"Authorization": f"Bearer {cfg.api_key}"}, timeout=15)
+        skip = ("whisper", "guard", "safeguard", "tts", "orpheus", "playai")
+        return sorted(m["id"] for m in r.json().get("data", []) if not any(k in m["id"] for k in skip))
+    except Exception:
+        return []
+
+
 def call_llm(cfg: LLMConfig, system: str, prompt: str, temperature: float = 0.7) -> str:
+    try:
+        return _call_llm_once(cfg, system, prompt, temperature)
+    except ModelNotFound as exc:
+        names = available_models(cfg)
+        hint = (" Models your key can use: " + ", ".join(names[:8]) + ". Paste one into the 'Model name' box."
+                if names else " Check the current model list in your provider's console and paste a name into 'Model name'.")
+        raise LLMError(str(exc) + hint) from None
+
+
+def _call_llm_once(cfg: LLMConfig, system: str, prompt: str, temperature: float = 0.7) -> str:
     model = cfg.model or DEFAULT_MODELS.get(cfg.provider, "")
     if cfg.provider == "Gemini":
         data = _post(
@@ -79,8 +120,7 @@ def call_llm(cfg: LLMConfig, system: str, prompt: str, temperature: float = 0.7)
             json={
                 "systemInstruction": {"parts": [{"text": system}]},
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": temperature, "responseMimeType": "application/json",
-                                     "maxOutputTokens": 8192},
+                "generationConfig": _gemini_config(model, temperature),
             },
         )
         try:
